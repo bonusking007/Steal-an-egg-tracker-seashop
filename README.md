@@ -4,13 +4,17 @@ local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Workspace = game:GetService("Workspace")
 local StarterGui = game:GetService("StarterGui")
 
-local TRACKER_VERSION = "1.0.12"
+local TRACKER_VERSION = "1.0.15"
 local API_URL = "https://steal-an-egg-trackstats.vercel.app/api/update"
 local API_KEY = "BatmanSAE_9xK72pQ2026"
-local SEND_INTERVAL = 10
+local SEND_INTERVAL = 15
 local SEND_DATA = true
 local DEBUG_ICONS = false
 local DEBUG_ICON_LIMIT = 80
+local ICON_SYNC = true
+local ICON_SIZE = 64
+local ICON_SYNC_DELAY = 0.20
+local ICON_UPLOAD_URL = API_URL:gsub("/api/update$", "/api/icon-upload")
 
 repeat task.wait() until game:IsLoaded()
 local Player = Players.LocalPlayer or Players.PlayerAdded:Wait()
@@ -40,6 +44,7 @@ Config.API_URL = API_URL
 Config.API_KEY = API_KEY
 Config.SEND_INTERVAL = SEND_INTERVAL
 Config.SEND_DATA = SEND_DATA
+ICON_UPLOAD_URL = API_URL:gsub("/api/update$", "/api/icon-upload")
 
 if Env.SEASHOP_SAE_TRACKER_STOP then
     pcall(Env.SEASHOP_SAE_TRACKER_STOP)
@@ -137,6 +142,322 @@ local function getRawIcon(Value)
     end
 
     return Text
+end
+
+
+local function base64Encode(Data)
+    local Alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+    local Out = {}
+    local Length = #Data
+    local Index = 1
+
+    while Index <= Length do
+        local A = string.byte(Data, Index) or 0
+        local B = string.byte(Data, Index + 1) or 0
+        local C = string.byte(Data, Index + 2) or 0
+        local Value = A * 65536 + B * 256 + C
+
+        local I1 = math.floor(Value / 262144) % 64 + 1
+        local I2 = math.floor(Value / 4096) % 64 + 1
+        local I3 = math.floor(Value / 64) % 64 + 1
+        local I4 = Value % 64 + 1
+
+        Out[#Out + 1] = Alphabet:sub(I1, I1)
+        Out[#Out + 1] = Alphabet:sub(I2, I2)
+        Out[#Out + 1] = Index + 1 <= Length and Alphabet:sub(I3, I3) or "="
+        Out[#Out + 1] = Index + 2 <= Length and Alphabet:sub(I4, I4) or "="
+
+        Index += 3
+    end
+
+    return table.concat(Out)
+end
+
+local CRC32Table
+local function getCRC32Table()
+    if CRC32Table then
+        return CRC32Table
+    end
+
+    CRC32Table = {}
+
+    for I = 0, 255 do
+        local C = I
+        for _ = 1, 8 do
+            if bit32.band(C, 1) == 1 then
+                C = bit32.bxor(0xEDB88320, bit32.rshift(C, 1))
+            else
+                C = bit32.rshift(C, 1)
+            end
+        end
+        CRC32Table[I] = C
+    end
+
+    return CRC32Table
+end
+
+local function crc32(Data)
+    local Table = getCRC32Table()
+    local CRC = 0xFFFFFFFF
+
+    for I = 1, #Data do
+        CRC = bit32.bxor(
+            bit32.rshift(CRC, 8),
+            Table[bit32.band(bit32.bxor(CRC, string.byte(Data, I)), 255)]
+        )
+    end
+
+    return bit32.bxor(CRC, 0xFFFFFFFF)
+end
+
+local function adler32(Data)
+    local A = 1
+    local B = 0
+    local Index = 1
+
+    while Index <= #Data do
+        local Last = math.min(Index + 3000, #Data)
+        for I = Index, Last do
+            A += string.byte(Data, I)
+            B += A
+        end
+        A %= 65521
+        B %= 65521
+        Index = Last + 1
+    end
+
+    return B * 65536 + A
+end
+
+local function u32be(Value)
+    return string.char(
+        bit32.band(bit32.rshift(Value, 24), 255),
+        bit32.band(bit32.rshift(Value, 16), 255),
+        bit32.band(bit32.rshift(Value, 8), 255),
+        bit32.band(Value, 255)
+    )
+end
+
+local function pngChunk(Name, Data)
+    return u32be(#Data) .. Name .. Data .. u32be(crc32(Name .. Data))
+end
+
+local function zlibStore(Data)
+    local Parts = { string.char(120, 1) }
+    local Index = 1
+
+    while Index <= #Data do
+        local Length = math.min(65535, #Data - Index + 1)
+        local Final = Index + Length - 1 >= #Data and 1 or 0
+        local Inverse = 65535 - Length
+
+        Parts[#Parts + 1] = string.char(Final)
+        Parts[#Parts + 1] = string.char(
+            bit32.band(Length, 255),
+            bit32.band(bit32.rshift(Length, 8), 255)
+        )
+        Parts[#Parts + 1] = string.char(
+            bit32.band(Inverse, 255),
+            bit32.band(bit32.rshift(Inverse, 8), 255)
+        )
+        Parts[#Parts + 1] = Data:sub(Index, Index + Length - 1)
+
+        Index += Length
+    end
+
+    Parts[#Parts + 1] = u32be(adler32(Data))
+    return table.concat(Parts)
+end
+
+local function captureAssetPng(AssetId, Size)
+    AssetId = tonumber(AssetId)
+    Size = tonumber(Size) or 64
+
+    if not AssetId or AssetId <= 0 then
+        return nil
+    end
+
+    local AssetService = game:GetService("AssetService")
+    local EditableImage
+
+    local ContentValue
+    pcall(function()
+        ContentValue = Content.fromAssetId(AssetId)
+    end)
+
+    local Created = pcall(function()
+        EditableImage = AssetService:CreateEditableImageAsync(
+            ContentValue or ("rbxassetid://" .. tostring(AssetId))
+        )
+    end)
+
+    if not Created or not EditableImage then
+        return nil
+    end
+
+    local Success, Result = pcall(function()
+        local SourceSize = EditableImage.Size
+        local Width = math.floor(SourceSize.X)
+        local Height = math.floor(SourceSize.Y)
+
+        if Width < 1 or Height < 1 then
+            return nil
+        end
+
+        local Pixels = EditableImage:ReadPixelsBuffer(Vector2.zero, SourceSize)
+        local Rows = {}
+
+        for Y = 0, Size - 1 do
+            local SourceY = math.floor(Y * Height / Size)
+            local Row = { "\0" }
+
+            for X = 0, Size - 1 do
+                local SourceX = math.floor(X * Width / Size)
+                local Offset = (SourceY * Width + SourceX) * 4
+
+                Row[#Row + 1] = string.char(
+                    buffer.readu8(Pixels, Offset),
+                    buffer.readu8(Pixels, Offset + 1),
+                    buffer.readu8(Pixels, Offset + 2),
+                    buffer.readu8(Pixels, Offset + 3)
+                )
+            end
+
+            Rows[#Rows + 1] = table.concat(Row)
+        end
+
+        local Raw = table.concat(Rows)
+        local Header = u32be(Size) .. u32be(Size) .. string.char(8, 6, 0, 0, 0)
+
+        return "\137PNG\r\n\26\n"
+            .. pngChunk("IHDR", Header)
+            .. pngChunk("IDAT", zlibStore(Raw))
+            .. pngChunk("IEND", "")
+    end)
+
+    pcall(function()
+        EditableImage:Destroy()
+    end)
+
+    return Success and Result or nil
+end
+
+local IconQueue = {}
+local IconQueued = {}
+local IconUploaded = {}
+local IconAttempts = {}
+local IconWorkerRunning = false
+local IconDone = 0
+local IconFailed = 0
+
+local function queueIcon(AssetId)
+    if not ICON_SYNC then
+        return
+    end
+
+    AssetId = tonumber(AssetId)
+
+    if not AssetId or AssetId <= 0 or IconUploaded[AssetId] or IconQueued[AssetId] then
+        return
+    end
+
+    if (IconAttempts[AssetId] or 0) >= 2 then
+        return
+    end
+
+    IconQueued[AssetId] = true
+    IconQueue[#IconQueue + 1] = AssetId
+end
+
+local function uploadExactIcon(AssetId)
+    local Png = captureAssetPng(AssetId, ICON_SIZE)
+
+    if not Png then
+        return false
+    end
+
+    local Encoded = base64Encode(Png)
+
+    local Success, Response = pcall(function()
+        return Request({
+            Url = ICON_UPLOAD_URL,
+            Method = "POST",
+            Headers = {
+                ["Content-Type"] = "application/json",
+                ["X-API-Key"] = API_KEY
+            },
+            Body = HttpService:JSONEncode({
+                assetId = AssetId,
+                png = Encoded
+            }),
+            Timeout = 20
+        })
+    end)
+
+    if not Success then
+        return false
+    end
+
+    local StatusCode = tonumber(Response.StatusCode or Response.Status) or 0
+    return StatusCode >= 200 and StatusCode < 300
+end
+
+local function startIconWorker()
+    if IconWorkerRunning or not ICON_SYNC then
+        return
+    end
+
+    IconWorkerRunning = true
+
+    task.spawn(function()
+        while Running do
+            local AssetId = table.remove(IconQueue, 1)
+
+            if not AssetId then
+                break
+            end
+
+            IconQueued[AssetId] = nil
+            IconAttempts[AssetId] = (IconAttempts[AssetId] or 0) + 1
+
+            if uploadExactIcon(AssetId) then
+                IconUploaded[AssetId] = true
+                IconDone += 1
+            else
+                IconFailed += 1
+            end
+
+            task.wait(ICON_SYNC_DELAY)
+        end
+
+        IconWorkerRunning = false
+
+        if IconDone > 0 or IconFailed > 0 then
+            print(("SEASHOP: exact icon cache | uploaded %d | failed %d"):format(IconDone, IconFailed))
+        end
+    end)
+end
+
+local function queueSnapshotIcons(Payload)
+    if not ICON_SYNC or type(Payload) ~= "table" then
+        return
+    end
+
+    for _, Item in ipairs(Payload.pets or {}) do
+        queueIcon(Item.petIconAssetId or Item.iconAssetId)
+    end
+
+    for _, List in ipairs({
+        Payload.eggs or {},
+        Payload.fieldEggs or {},
+        Payload.stolenEggs or {}
+    }) do
+        for _, Item in ipairs(List) do
+            queueIcon(Item.eggIconAssetId or Item.iconAssetId)
+        end
+    end
+
+    startIconWorker()
 end
 
 local DebuggedCategories = {}
@@ -699,6 +1020,7 @@ local function sendSnapshot()
     end
 
     local Payload = buildSnapshot()
+    queueSnapshotIcons(Payload)
     debugSnapshotIcons(Payload)
 
     local Success, Response = pcall(function()
