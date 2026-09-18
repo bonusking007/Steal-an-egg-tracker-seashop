@@ -4,11 +4,13 @@ local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Workspace = game:GetService("Workspace")
 local StarterGui = game:GetService("StarterGui")
 
-local TRACKER_VERSION = "1.0.10"
+local TRACKER_VERSION = "1.0.12"
 local API_URL = "https://steal-an-egg-trackstats.vercel.app/api/update"
 local API_KEY = "BatmanSAE_9xK72pQ2026"
-local SEND_INTERVAL = 15
+local SEND_INTERVAL = 10
 local SEND_DATA = true
+local DEBUG_ICONS = false
+local DEBUG_ICON_LIMIT = 80
 
 repeat task.wait() until game:IsLoaded()
 local Player = Players.LocalPlayer or Players.PlayerAdded:Wait()
@@ -137,6 +139,67 @@ local function getRawIcon(Value)
     return Text
 end
 
+local DebuggedCategories = {}
+local DebugIconCount = 0
+
+local function describeIcon(Value)
+    local ValueType = typeof(Value)
+    local Text = ""
+
+    local Success = pcall(function()
+        Text = tostring(Value)
+    end)
+
+    if not Success then
+        Text = "<tostring failed>"
+    end
+
+    if #Text > 220 then
+        Text = Text:sub(1, 220) .. "..."
+    end
+
+    return ValueType, Text
+end
+
+local function debugAssetIcons(Category, Data, Egg, ParsedPetId, ParsedEggId)
+    if not DEBUG_ICONS or DebuggedCategories[Category] or DebugIconCount >= DEBUG_ICON_LIMIT then
+        return
+    end
+
+    DebuggedCategories[Category] = true
+    DebugIconCount += 1
+
+    local PetType, PetRaw = describeIcon(Data and Data.Icon)
+    local EggType, EggRaw = describeIcon(Egg and Egg.Icon)
+
+    print(("[SEASHOP ICON DEBUG] category=%s display=%s"):format(
+        tostring(Category),
+        tostring(Data and Data.DisplayName or "?")
+    ))
+    print(("  petIconType=%s parsedId=%s raw=%s"):format(
+        PetType,
+        tostring(ParsedPetId),
+        PetRaw
+    ))
+    print(("  eggIconType=%s parsedId=%s raw=%s"):format(
+        EggType,
+        tostring(ParsedEggId),
+        EggRaw
+    ))
+
+    if ParsedPetId == 0 and PetRaw ~= "" then
+        warn("[SEASHOP ICON DEBUG] pet icon exists but parser returned 0:", tostring(Category), PetRaw)
+    end
+
+    if ParsedEggId == 0 and EggRaw ~= "" then
+        warn("[SEASHOP ICON DEBUG] egg icon exists but parser returned 0:", tostring(Category), EggRaw)
+    end
+
+    if (PetRaw == "" or PetRaw == "nil") and (EggRaw == "" or EggRaw == "nil") then
+        warn("[SEASHOP ICON DEBUG] NO ICON FOUND IN ASSETS:", tostring(Category))
+    end
+end
+
 local function getAssetInfo(Category)
     local Data = Assets[Category]
 
@@ -184,6 +247,10 @@ local function getAssetInfo(Category)
     end
 
     local Egg = type(Data.Egg) == "table" and Data.Egg or {}
+    local PetIconId = getAssetId(Data.Icon)
+    local EggIconId = getAssetId(Egg.Icon)
+
+    debugAssetIcons(Category, Data, Egg, PetIconId, EggIconId)
 
     return {
         name = tostring(Data.DisplayName or Category),
@@ -192,8 +259,8 @@ local function getAssetInfo(Category)
         rarityNumber = RarityNumber,
         rarityColor = RarityColor,
         income = tonumber(Data.EarningRate) or 0,
-        icon = getAssetId(Data.Icon),
-        eggIcon = getAssetId(Egg.Icon),
+        icon = PetIconId,
+        eggIcon = EggIconId,
         iconRaw = getRawIcon(Data.Icon),
         eggIconRaw = getRawIcon(Egg.Icon),
         growthTime = tonumber(Egg.GrowthTime) or 120
@@ -575,12 +642,64 @@ local function buildSnapshot()
     }
 end
 
+local function debugSnapshotIcons(Payload)
+    if not DEBUG_ICONS then
+        return
+    end
+
+    local Missing = {}
+    local Seen = {}
+
+    local function check(List, Kind)
+        for _, Item in ipairs(List or {}) do
+            local Raw = tostring(Item.icon or Item.petIcon or Item.eggIcon or "")
+            local Id = tonumber(Item.iconAssetId or Item.petIconAssetId or Item.eggIconAssetId) or 0
+
+            if Id == 0 and (Raw == "" or Raw == "nil") then
+                local Key = Kind .. ":" .. tostring(Item.category)
+                if not Seen[Key] then
+                    Seen[Key] = true
+                    table.insert(Missing, {
+                        kind = Kind,
+                        category = tostring(Item.category),
+                        name = tostring(Item.name)
+                    })
+                end
+            end
+        end
+    end
+
+    check(Payload.pets, "pet")
+    check(Payload.eggs, "egg")
+    check(Payload.fieldEggs, "field")
+
+    print(("[SEASHOP ICON DEBUG] snapshot pets=%d eggs=%d field=%d unresolvedCategories=%d"):format(
+        #(Payload.pets or {}),
+        #(Payload.eggs or {}),
+        #(Payload.fieldEggs or {}),
+        #Missing
+    ))
+
+    for Index, Item in ipairs(Missing) do
+        if Index > 30 then
+            warn("[SEASHOP ICON DEBUG] more unresolved categories omitted:", #Missing - 30)
+            break
+        end
+        warn(("[SEASHOP ICON DEBUG] unresolved %s category=%s name=%s"):format(
+            Item.kind,
+            Item.category,
+            Item.name
+        ))
+    end
+end
+
 local function sendSnapshot()
     if not SEND_DATA then
         return false
     end
 
     local Payload = buildSnapshot()
+    debugSnapshotIcons(Payload)
 
     local Success, Response = pcall(function()
         return Request({
